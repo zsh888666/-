@@ -1,0 +1,263 @@
+﻿#!/bin/bash
+
+#==============================================================================
+# x-ui 多IP站群手动配置生成脚本 v1.4
+# 调整：先显示JSON配置，再询问是否查看端口监听状态
+#==============================================================================
+
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+log_info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+log_step() { echo -e "${BLUE}[STEP]${NC} $1"; }
+log_warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+
+#==============================================================================
+# 主流程
+#==============================================================================
+main() {
+    clear
+    echo ""
+    echo "============================================================"
+    echo "     🎯 x-ui 多IP站群手动配置生成工具 v1.4"
+    echo "============================================================"
+    echo ""
+
+    # 步骤1：自动检测服务器所有IP
+    log_step "自动检测服务器所有IP地址..."
+    
+    IP_LIST=$(ip addr show 2>/dev/null | grep -E "inet [0-9]" | grep -v "127.0.0.1" | awk '{print $2}' | cut -d'/' -f1 | sort -V)
+    
+    if [ -z "$IP_LIST" ]; then
+        log_warn "未检测到IP地址"
+        exit 1
+    fi
+    
+    # 存储IP到数组
+    IP_ARRAY=()
+    while IFS= read -r ip; do
+        IP_ARRAY+=("$ip")
+    done <<< "$IP_LIST"
+    
+    TOTAL_IPS=${#IP_ARRAY[@]}
+    log_info "检测到 $TOTAL_IPS 个IP地址"
+    echo ""
+
+    # 步骤2：用户选择起始端口
+    log_step "请设置起始端口（每个IP对应一个端口）"
+    read -p "起始端口 [默认: 20001]: " START_PORT
+    START_PORT=${START_PORT:-20001}
+    
+    # 验证端口是否为数字
+    if ! [[ "$START_PORT" =~ ^[0-9]+$ ]]; then
+        log_warn "端口号必须为数字，使用默认值20001"
+        START_PORT=20001
+    fi
+    echo ""
+
+    # 步骤3：生成精简版JSON配置
+    log_step "生成可直接粘贴的Xray JSON配置..."
+    
+    JSON_FILE="/root/xray_manual_config.json"
+    
+    # 使用临时文件构建JSON，避免 \n 转义问题
+    {
+        # 写入JSON头部
+        cat << 'EOF'
+{
+  "api": {
+    "services": ["HandlerService", "LoggerService", "StatsService"],
+    "tag": "api"
+  },
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 62789,
+      "protocol": "dokodemo-door",
+      "settings": {"address": "127.0.0.1"},
+      "tag": "api"
+    }
+  ],
+  "outbounds": [
+EOF
+        
+        # 写入每个IP的outbound规则
+        for i in "${!IP_ARRAY[@]}"; do
+            tag="ip$((i+1))"
+            ip="${IP_ARRAY[$i]}"
+            printf '    {"tag":"%s","sendThrough":"%s","protocol":"freedom","settings":{}},\n' "$tag" "$ip"
+        done
+        
+        # 写入默认outbound和blocked
+        cat << 'EOF'
+    {"protocol":"freedom","settings":{}},
+    {"protocol":"blackhole","settings":{},"tag":"blocked"}
+  ],
+  "policy": {
+    "system": {
+      "statsInboundDownlink": true,
+      "statsInboundUplink": true
+    }
+  },
+  "routing": {
+    "rules": [
+EOF
+        
+        # 写入每个IP的routing规则
+        for i in "${!IP_ARRAY[@]}"; do
+            port=$((START_PORT + i))
+            tag="ip$((i+1))"
+            printf '      {"inboundTag":["inbound-%s"],"outboundTag":"%s","type":"field"},\n' "$port" "$tag"
+        done
+        
+        # 写入默认routing规则和JSON尾部
+        cat << 'EOF'
+      {"inboundTag":["api"],"outboundTag":"api","type":"field"},
+      {"ip":["geoip:private"],"outboundTag":"blocked","type":"field"}
+    ]
+  },
+  "stats": {}
+}
+EOF
+    } > "$JSON_FILE"
+    
+    log_info "✅ JSON配置已保存到: $JSON_FILE"
+    
+    # 验证JSON格式
+    if command -v python3 &> /dev/null; then
+        if python3 -c "import json; json.load(open('$JSON_FILE'))" 2>/dev/null; then
+            log_info "✅ JSON格式验证通过"
+        else
+            log_warn "⚠️  JSON格式可能有问题，请检查"
+        fi
+    fi
+    echo ""
+
+    # 步骤4：显示IP-端口映射表
+    log_step "IP-端口映射表"
+    echo "------------------------------------------------------------"
+    printf "\033[1m%-6s %-20s %-10s\033[0m\n" "序号" "出口IP地址" "端口"
+    echo "------------------------------------------------------------"
+    
+    for i in "${!IP_ARRAY[@]}"; do
+        printf "%-6s %-20s %-10s\n" "$((i+1))" "${IP_ARRAY[$i]}" "$((START_PORT + i))"
+    done
+    
+    echo "------------------------------------------------------------"
+    echo ""
+
+    # 步骤5：显示JSON配置（调整到这里）
+    log_info "下面是可直接复制的JSON配置（已保存到文件）："
+    echo "------------------------------------------------------------"
+    cat "$JSON_FILE"
+    echo "------------------------------------------------------------"
+    echo ""
+
+    # 步骤6：询问是否查看端口监听状态（调整后到这里）
+    read -p "是否要查看端口监听状态？ [y/N]: " show_status
+    
+    if [ "$show_status" = "y" ] || [ "$show_status" = "Y" ]; then
+        log_step "正在检查端口监听状态..."
+        echo "------------------------------------------------------------"
+        printf "%-6s %-20s %-10s %-15s\n" "序号" "IP地址" "端口" "监听状态"
+        echo "------------------------------------------------------------"
+        
+        for i in "${!IP_ARRAY[@]}"; do
+            port=$((START_PORT + i))
+            ip="${IP_ARRAY[$i]}"
+            
+            # 检查端口是否监听
+            if ss -tlnp 2>/dev/null | grep -q ":$port "; then
+                status="✅ 监听中"
+            else
+                status="❌ 未监听"
+            fi
+            
+            printf "%-6s %-20s %-10s %-15s\n" "$((i+1))" "$ip" "$port" "$status"
+        done
+        
+        echo "------------------------------------------------------------"
+        echo ""
+        log_info "提示：如果状态为'❌ 未监听'，请先重启x-ui服务"
+        echo "      命令：systemctl restart x-ui"
+        echo ""
+    fi
+
+    # 步骤7：提供手动操作说明（调整后）
+    log_step "后续手动操作步骤"
+    echo "------------------------------------------------------------"
+    echo "1. 登录x-ui面板"
+    echo "   地址: http://<你的服务器IP>:<面板端口>"
+    echo ""
+    echo "2. 配置Xray核心"
+    echo "   - 进入: 设置 → Xray相关设置"
+    echo "   - 删除原有内容"
+    echo "   - 复制JSON配置（见上方输出）"
+    echo "   - 粘贴到面板"
+    echo "   - 点击: 保存配置 → 重启Xray"
+    echo ""
+    echo "3. 批量创建入站规则"
+    echo "   - 进入: 入站列表 → 批量导入"
+    echo "   - 使用CSV格式导入，内容为:"
+    echo "     端口,协议,传输方式,备注"
+    for i in "${!IP_ARRAY[@]}"; do
+        if [ $i -lt 3 ]; then
+            echo "     $((START_PORT + i)),vless,tcp,IP-$((i+1))-${IP_ARRAY[$i]}"
+        fi
+    done
+    [ $TOTAL_IPS -gt 3 ] && echo "     ...（共$TOTAL_IPS条）"
+    echo ""
+    echo "4. 配置防火墙"
+    echo "   sudo ufw allow $START_PORT:$((START_PORT + TOTAL_IPS - 1))/tcp"
+    echo "   sudo ufw reload"
+    echo ""
+    echo "5. 验证"
+    echo "   systemctl restart x-ui"
+    echo "   ss -tlnp | grep xray"
+    echo "------------------------------------------------------------"
+    echo ""
+    
+    # 步骤8：保存配置摘要（调整后）
+    cat > /root/config_summary.txt <<EOF
+============================================================
+          x-ui 多IP站群配置摘要
+============================================================
+
+IP数量: $TOTAL_IPS 个
+起始端口: $START_PORT
+结束端口: $((START_PORT + TOTAL_IPS - 1))
+
+配置文件路径:
+  JSON配置: $JSON_FILE
+
+IP-端口映射表查看:
+  cat /root/ip_port_mapping.txt
+
+============================================================
+EOF
+
+    log_info "✅ 配置摘要已保存到: /root/config_summary.txt"
+    
+    # 生成单独的映射表文件
+    MAP_FILE="/root/ip_port_mapping.txt"
+    {
+        echo "IP-端口映射表"
+        echo "----------------------------------------"
+        printf "%-6s %-20s %-10s\n" "序号" "出口IP地址" "端口"
+        echo "----------------------------------------"
+        for i in "${!IP_ARRAY[@]}"; do
+            printf "%-6s %-20s %-10s\n" "$((i+1))" "${IP_ARRAY[$i]}" "$((START_PORT + i))"
+        done
+        echo "----------------------------------------"
+    } > "$MAP_FILE"
+    
+    log_info "✅ 映射表已保存到: $MAP_FILE"
+    echo ""
+}
+
+# 执行主流程
+main
